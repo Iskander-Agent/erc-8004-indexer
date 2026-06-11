@@ -9,6 +9,13 @@
  *   ![Agent](https://erc8004.aibtc.com/api/v1/agents/42/badge?style=pill)
  *   ![Agent](https://erc8004.aibtc.com/api/v1/agents/42/badge?style=card)
  *
+ * ⚠️  Embedding notes:
+ *   - <img> embed: static badge only. Browsers strip all scripting from SVGs
+ *     loaded via <img> (security baseline since ~2014), so the copy-to-clipboard
+ *     buttons are non-functional. Use <img> for GitHub READMEs and profiles.
+ *   - <object> or inline <svg>: copy buttons work, but carries XSS risk if the
+ *     page CSP is permissive. Only embed via <object>/<svg> on trusted origins.
+ *
  * Data source: D1 database (agents + agent_metadata tables).
  * All data is on-chain verified — no external API calls.
  *
@@ -18,9 +25,14 @@
  *   card               — 380×92px wide card with registered block + metadata count
  *
  * Cache headers:
- *   success  → public, max-age=3600, stale-while-revalidate=86400
+ *   success   → public, max-age=3600, stale-while-revalidate=86400
  *   not found → public, max-age=300
- *   error   → no-store
+ *   error     → no-store
+ *
+ * Cache normalization: the only recognized query parameter is `style`. Unknown
+ * parameters (e.g. ?v=123) are ignored by the handler but may create separate
+ * edge-cache entries. Configure CF Cache Rules to normalize on `style` only
+ * to prevent cache fragmentation from arbitrary query strings.
  */
 
 import { Hono } from "hono";
@@ -35,12 +47,30 @@ export const badgeRoute = new Hono<{
 
 // ── SVG utilities ─────────────────────────────────────────────────────────────
 
-function esc(s: unknown): string {
+/**
+ * Escape a value for safe embedding inside SVG attribute values and text nodes.
+ *
+ * Covers all five XML/HTML special characters including single-quote (&#39;),
+ * which is required to prevent attribute injection in onclick handlers that
+ * delimit strings with single quotes — e.g. onclick="fn('${esc(val)}')".
+ * Without escaping ', a malicious agent metadata value could break out of the
+ * JS string context and execute arbitrary script when the SVG is embedded via
+ * <object> or inline.
+ *
+ * Note: trunc() is applied before esc() in some callers, which means an HTML
+ * entity that spans the truncation boundary will render as a broken & — this is
+ * a cosmetic issue only (no security impact), since esc() is always the final
+ * transform applied to user-controlled data.
+ *
+ * Exported for unit testing.
+ */
+export function esc(s: unknown): string {
   return String(s ?? "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 function abbrev(addr: string, head = 8, tail = 6): string {
@@ -176,7 +206,12 @@ function buildPillBadge(d: BadgeData): string {
     ? trunc(d.displayName, 22)
     : null;
 
-  const idW = 8 + String(d.agentId).length * 5.8;
+  // 5.8px per digit is a font-metric approximation for the 9px bold sans-serif
+  // used by the agent ID. Accurate for IDs up to ~4 digits; for 5+ digit IDs
+  // the pill may run slightly wide but remains readable. Capped at 10 digits to
+  // prevent runaway widths if the registry ever scales past 9,999,999,999.
+  const idDigits = Math.min(String(d.agentId).length, 10);
+  const idW = 8 + idDigits * 5.8;
   const nmW = name ? 8 + name.length * 5.3 + 8 : 0;
   const rightW = Math.max(88, Math.ceil(8 + idW + nmW + 56));
   const W = LEFT_W + rightW;
@@ -402,6 +437,10 @@ badgeRoute.get("/agents/:id/badge", async (c) => {
     );
   }
 
+  // profileUrl is always server-constructed with a fixed https:// prefix.
+  // data.owner is the on-chain STX address (SP… format, verified by the indexer)
+  // and is never sourced from agent-supplied metadata, so javascript:/data: injection
+  // is not possible here. No scheme validation is required.
   const profileUrl = `https://aibtc.com/agents/${data.owner}`;
   const badgeData: BadgeData = {
     agentId: data.agent_id,
@@ -413,6 +452,9 @@ badgeRoute.get("/agents/:id/badge", async (c) => {
     profileUrl,
   };
 
+  // metadata_count is fetched by queryAgentForBadge for all styles but only
+  // displayed by the card variant. The cost is negligible (single COUNT in the
+  // same JOIN), and keeping the query shape consistent simplifies the type surface.
   let svg: string;
   if (style === "pill") {
     svg = buildPillBadge(badgeData);

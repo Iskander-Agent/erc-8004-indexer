@@ -7,6 +7,7 @@ import { describe, it, expect, beforeEach } from "vitest";
 import { SELF, env as rawEnv } from "cloudflare:test";
 import type { Env } from "../types";
 import { setupDb, clearData } from "./helpers";
+import { esc } from "../routes/badge";
 
 import applyIdentityFixture from "./fixtures/apply-identity.json";
 
@@ -37,6 +38,50 @@ beforeEach(async () => {
   const res = await postWebhook(applyIdentityFixture);
   if (!res.ok) throw new Error(`Identity fixture failed: ${res.status}`);
 });
+
+// ── esc() unit tests ──────────────────────────────────────────────────────────
+
+describe("esc()", () => {
+  it("escapes all five XML/HTML special characters", () => {
+    expect(esc(`&<>"'`)).toBe("&amp;&lt;&gt;&quot;&#39;");
+  });
+
+  it("escapes single quotes — prevents onclick attribute injection", () => {
+    // A malicious agent name containing a single quote must not break out of
+    // onclick="fn('${esc(val)}')" — if ' is unescaped the string terminates early.
+    expect(esc("it's me")).toBe("it&#39;s me");
+    expect(esc("'; alert(1); //")).toBe("&#39;; alert(1); //");
+  });
+
+  it("escapes double quotes — prevents attribute boundary injection", () => {
+    expect(esc(`"><svg/onload=alert(1)>`)).toBe(
+      "&quot;&gt;&lt;svg/onload=alert(1)&gt;"
+    );
+  });
+
+  it("escapes ampersands first to avoid double-encoding", () => {
+    expect(esc("a & b")).toBe("a &amp; b");
+    // Ensure & in an entity-like string doesn't produce double-encoding
+    expect(esc("&amp;")).toBe("&amp;amp;");
+  });
+
+  it("handles null and undefined gracefully", () => {
+    expect(esc(null)).toBe("");
+    expect(esc(undefined)).toBe("");
+  });
+
+  it("handles non-string inputs", () => {
+    expect(esc(42)).toBe("42");
+    expect(esc(true)).toBe("true");
+  });
+
+  it("passes clean strings through unchanged", () => {
+    const clean = "ERC-8004 AGENT #42";
+    expect(esc(clean)).toBe(clean);
+  });
+});
+
+// ── Route integration tests ───────────────────────────────────────────────────
 
 describe("GET /api/v1/agents/:id/badge", () => {
   it("returns SVG with correct Content-Type for registered agent", async () => {
@@ -99,5 +144,16 @@ describe("GET /api/v1/agents/:id/badge", () => {
     expect(res.status).toBe(400);
     const body = await res.text();
     expect(body).toContain("style must be");
+  });
+
+  it("ignores unknown query params and returns valid badge", async () => {
+    // Unknown params like ?v=123 must not affect the response — the handler only
+    // reads `style`. This also documents that cache normalization (to avoid
+    // edge-cache fragmentation) must be handled at the CF Cache Rules layer.
+    const res = await getBadge("/agents/1/badge?style=pill&v=123&bust=abc");
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain("<svg");
+    expect(body).toContain('height="24"');
   });
 });
