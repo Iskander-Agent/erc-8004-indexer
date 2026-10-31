@@ -16,8 +16,10 @@
  *   - <object> or inline <svg>: copy buttons work, but carries XSS risk if the
  *     page CSP is permissive. Only embed via <object>/<svg> on trusted origins.
  *
- * Data source: D1 database (agents + agent_metadata tables).
- * All data is on-chain verified — no external API calls.
+ * Data source: D1 database (agents + agent_metadata tables). On a D1 miss the
+ * route asks identity-registry-v2 (read-only get-owner, 3s timeout) and renders an
+ * "indexing" badge if the agent exists; it only reports 404 when the registry
+ * confirms the id is unregistered, and 503 when the registry can't be reached.
  *
  * Styles:
  *   standard (default) — 340×64px full-featured badge
@@ -26,8 +28,9 @@
  *
  * Cache headers:
  *   success   → public, max-age=3600, stale-while-revalidate=86400
- *   not found → public, max-age=300
- *   error     → no-store
+ *   indexing  → public, max-age=60 (D1 miss, agent exists on chain)
+ *   not found → no-store (registry confirms absence)
+ *   error     → no-store (incl. 503 when the registry is unreachable)
  *
  * Cache normalization: the only recognized query parameter is `style`. Unknown
  * parameters (e.g. ?v=123) are ignored by the handler but may create separate
@@ -39,6 +42,7 @@ import { Hono } from "hono";
 import type { Env, AppVariables } from "../types";
 import { parseAgentId } from "./helpers";
 import { queryAgentForBadge } from "../utils/query";
+import { lookupRegistryOwner } from "../utils/registry";
 
 export const badgeRoute = new Hono<{
   Bindings: Env;
@@ -92,6 +96,8 @@ interface BadgeData {
   bnsName: string | null;
   registeredAt: number;
   profileUrl: string;
+  /** True when the agent was resolved from the on-chain registry because D1 has not indexed it yet. */
+  indexing?: boolean;
 }
 
 function buildStandardBadge(d: BadgeData): string {
@@ -168,7 +174,7 @@ function buildStandardBadge(d: BadgeData): string {
           font-size="10" font-weight="500" fill="#8ba4c4">${esc(sub)}</text>
     <text x="${W - 82}" y="37" text-anchor="end"
           font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif"
-          font-size="7.5" fill="rgba(125,162,255,0.85)">✓ on-chain</text>
+          font-size="7.5" fill="rgba(125,162,255,0.85)">${d.indexing ? "indexing…" : "✓ on-chain"}</text>
     <a href="${esc(d.profileUrl)}" target="_blank">
       <text x="${W - 8}" y="37"
             font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif"
@@ -251,7 +257,7 @@ function buildPillBadge(d: BadgeData): string {
     <a href="${esc(d.profileUrl)}" target="_blank">
       <text x="${chkX}" y="15.5"
             font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif"
-            font-size="7.5" fill="rgba(125,162,255,0.85)" text-anchor="end">✓</text>
+            font-size="7.5" fill="rgba(125,162,255,0.85)" text-anchor="end">${d.indexing ? "…" : "✓"}</text>
     </a>
   </g>
 </svg>`;
@@ -336,7 +342,7 @@ function buildCardBadge(d: BadgeData & { metadataCount: number }): string {
           font-size="10" font-weight="500" fill="#8ba4c4">${esc(sub)}</text>
     <text x="${W - 82}" y="37" text-anchor="end"
           font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif"
-          font-size="7.5" fill="rgba(125,162,255,0.85)">✓ on-chain</text>
+          font-size="7.5" fill="rgba(125,162,255,0.85)">${d.indexing ? "indexing…" : "✓ on-chain"}</text>
     <a href="${esc(d.profileUrl)}" target="_blank">
       <text x="${W - 8}" y="37"
             font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif"
@@ -364,10 +370,10 @@ function buildCardBadge(d: BadgeData & { metadataCount: number }): string {
     <!-- Footer: registered block · metadata count -->
     <text x="12" y="82"
           font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif"
-          font-size="7" fill="rgba(255,255,255,0.25)">registered block ${d.registeredAt.toLocaleString()}</text>
+          font-size="7" fill="rgba(255,255,255,0.25)">${d.indexing ? "registered · block pending index" : `registered block ${d.registeredAt.toLocaleString()}`}</text>
     <text x="${W - 8}" y="82"
           font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif"
-          font-size="7" fill="rgba(255,255,255,0.25)" text-anchor="end">${d.metadataCount} metadata key${d.metadataCount === 1 ? "" : "s"}</text>
+          font-size="7" fill="rgba(255,255,255,0.25)" text-anchor="end">${d.indexing ? "metadata pending" : `${d.metadataCount} metadata key${d.metadataCount === 1 ? "" : "s"}`}</text>
   </g>
 </svg>`;
 }
@@ -411,6 +417,42 @@ function svgResponse(
   });
 }
 
+// ── D1 miss: ask the registry before claiming anything ────────────────────────
+// A D1 miss only means "not indexed", not "not registered". Resolve against
+// identity-registry-v2 so a missing badge always means a missing agent.
+
+async function fallbackFromRegistry(
+  env: Env,
+  agentId: number,
+  style: string
+): Promise<Response> {
+  const found = await lookupRegistryOwner(env, agentId);
+  if (found.state === "none") {
+    return svgResponse(errorSvg("agent not found", true), 404, "no-store");
+  }
+  if (found.state === "unknown") {
+    return svgResponse(errorSvg("registry unavailable", true), 503, "no-store");
+  }
+  const badgeData: BadgeData = {
+    agentId,
+    stxAddress: found.owner,
+    btcAddress: null,
+    displayName: null,
+    bnsName: null,
+    registeredAt: 0,
+    profileUrl: `https://aibtc.com/agents/${found.owner}`,
+    indexing: true,
+  };
+  const svg =
+    style === "pill"
+      ? buildPillBadge(badgeData)
+      : style === "card"
+      ? buildCardBadge({ ...badgeData, metadataCount: 0 })
+      : buildStandardBadge(badgeData);
+  // Short TTL: the full badge replaces this as soon as the indexer catches up.
+  return svgResponse(svg, 200, "public, max-age=60");
+}
+
 // ── Route handler ─────────────────────────────────────────────────────────────
 
 badgeRoute.get("/agents/:id/badge", async (c) => {
@@ -429,13 +471,7 @@ badgeRoute.get("/agents/:id/badge", async (c) => {
   }
 
   const data = await queryAgentForBadge(c.env.DB, agentId);
-  if (!data) {
-    return svgResponse(
-      errorSvg("agent not found", true),
-      404,
-      "public, max-age=300"
-    );
-  }
+  if (!data) return fallbackFromRegistry(c.env, agentId, style);
 
   // profileUrl is always server-constructed with a fixed https:// prefix.
   // data.owner is the on-chain STX address (SP… format, verified by the indexer)

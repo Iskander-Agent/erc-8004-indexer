@@ -3,11 +3,12 @@
  *
  * Seeds D1 with agent #1 (no metadata values) and verifies badge responses.
  */
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { SELF, env as rawEnv } from "cloudflare:test";
 import type { Env } from "../types";
 import { setupDb, clearData } from "./helpers";
 import { esc } from "../routes/badge";
+import { parseOwnerResult } from "../utils/registry";
 
 import applyIdentityFixture from "./fixtures/apply-identity.json";
 
@@ -30,6 +31,18 @@ async function postWebhook(body: unknown): Promise<Response> {
 async function getBadge(path: string): Promise<Response> {
   return SELF.fetch(`${BASE_URL}${path}`);
 }
+
+const OWNER_HEX = "0x070a0516a11be198a7bc4ca2d45e0895ba7d0909bc1067f6";
+
+function mockRegistry(result: string | Error | number): void {
+  vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+    if (result instanceof Error) throw result;
+    if (typeof result === "number") return new Response("err", { status: result });
+    return Response.json({ okay: true, result });
+  });
+}
+
+afterEach(() => vi.restoreAllMocks());
 
 beforeEach(async () => {
   await setupDb(env.DB);
@@ -124,10 +137,12 @@ describe("GET /api/v1/agents/:id/badge", () => {
     expect(res.headers.get("Cache-Control")).toContain("max-age=3600");
   });
 
-  it("returns 404 SVG for unknown agent", async () => {
+  it("returns 404 SVG when D1 misses and the registry confirms the id is unregistered", async () => {
+    mockRegistry("0x0709");
     const res = await getBadge("/agents/9999/badge");
     expect(res.status).toBe(404);
     expect(res.headers.get("Content-Type")).toBe("image/svg+xml");
+    expect(res.headers.get("Cache-Control")).toBe("no-store");
     const body = await res.text();
     expect(body).toContain("agent not found");
   });
@@ -155,5 +170,58 @@ describe("GET /api/v1/agents/:id/badge", () => {
     const body = await res.text();
     expect(body).toContain("<svg");
     expect(body).toContain('height="24"');
+  });
+});
+
+// ── Registry fallback (D1 miss) ───────────────────────────────────────────────
+
+describe("badge registry fallback", () => {
+  it("renders an indexing badge (200, short TTL) when D1 misses but the registry has an owner", async () => {
+    mockRegistry(OWNER_HEX);
+    for (const style of ["standard", "pill", "card"]) {
+      const res = await getBadge(`/agents/9999/badge?style=${style}`);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("Cache-Control")).toBe("public, max-age=60");
+      const body = await res.text();
+      expect(body).toContain("<svg");
+      expect(body).toContain("…");
+      expect(body).toContain("SP2GHQRC"); // abbreviated owner is rendered
+    }
+  });
+
+  it("returns 503 no-store — never 404 — when the registry is unreachable", async () => {
+    for (const failure of [new Error("timeout"), 500, 429]) {
+      mockRegistry(failure);
+      const res = await getBadge("/agents/9999/badge");
+      expect(res.status).toBe(503);
+      expect(res.headers.get("Cache-Control")).toBe("no-store");
+      expect(await res.text()).toContain("registry unavailable");
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("does not call the registry on a D1 hit", async () => {
+    mockRegistry(new Error("must not be called"));
+    const res = await getBadge("/agents/1/badge");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Cache-Control")).toContain("max-age=3600");
+    expect(fetch).not.toHaveBeenCalled();
+  });
+});
+
+describe("parseOwnerResult()", () => {
+  it("decodes (ok (some principal)) to the c32check address", async () => {
+    expect(await parseOwnerResult(OWNER_HEX)).toEqual({
+      state: "owner",
+      owner: "SP2GHQRCRMYY4S8PMBR49BEKX144VR437YT42SF3B",
+    });
+  });
+  it("decodes (ok none) as none", async () => {
+    expect(await parseOwnerResult("0x0709")).toEqual({ state: "none" });
+  });
+  it("treats err / garbage as unknown", async () => {
+    expect(await parseOwnerResult("0x0801")).toEqual({ state: "unknown" });
+    expect(await parseOwnerResult("zz")).toEqual({ state: "unknown" });
+    expect(await parseOwnerResult("0x070a05")).toEqual({ state: "unknown" });
   });
 });
